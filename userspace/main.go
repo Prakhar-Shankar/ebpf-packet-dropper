@@ -1,82 +1,82 @@
 package main
 
 import (
-    "bytes"
-    "encoding/binary"
-    "fmt"
-    "log"
-    "os"
-    "strconv"
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"log"
 	"net"
-    "github.com/cilium/ebpf"
-    "github.com/cilium/ebpf/link"
-    "github.com/cilium/ebpf/rlimit"
+	"os"
+	"strconv"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 func must(err error) {
-    if err != nil {
-        log.Fatal(err)
-    }
+	if err != nil {
+		log.Fatal(err)
+	}
 }
+
 func htons(i uint16) uint16 {
-    return (i<<8)&0xff00 | i>>8
+	return (i<<8)&0xff00 | i>>8
 }
+
 func main() {
-    // Allow the current process to lock memory for BPF maps
-    must(rlimit.RemoveMemlock())
+	must(rlimit.RemoveMemlock())
 
-    // Load compiled program from ELF
-    spec, err := ebpf.LoadCollectionSpec("drop_tcp_port_kern.o")
-    must(err)
+	spec, err := ebpf.LoadCollectionSpec("drop_tcp_port_kern.o")
+	must(err)
 
-    coll, err := ebpf.NewCollection(spec)
-    must(err)
-    defer coll.Close()
+	coll, err := ebpf.NewCollection(spec)
+	must(err)
+	defer coll.Close()
 
-    prog := coll.Programs["drop_tcp_port"]
-    if prog == nil {
-        log.Fatalf("Program 'drop_tcp_port' not found")
-    }
+	prog := coll.Programs["drop_tcp_port"]
+	if prog == nil {
+		log.Fatalf("Program 'drop_tcp_port' not found")
+	}
 
-    iface := "wlp0s20f3" // adjust if needed
-    lnk, err := link.AttachXDP(link.XDPOptions{
-        Program:   prog,
-        Interface: ifaceIndex(iface),
-        Flags:     link.XDPGenericMode,
-    })
-    must(err)
-    defer lnk.Close()
+	ifaceName := "wlp0s20f3"
+	iface, err := net.InterfaceByName(ifaceName)
+	must(err)
 
-    // Set the blocked port
-    port := uint16(4040)
-    if len(os.Args) > 1 {
-        p, err := strconv.Atoi(os.Args[1])
-        if err == nil && p > 0 && p < 65535 {
-            port = uint16(p)
-        }
-    }
+	// Clean up any existing link
+	link.CloseAll()
 
-    fmt.Printf("Blocking TCP port: %d\n", port)
+	// Attach and replace existing XDP if needed
+	lnk, err := link.AttachXDP(link.XDPOptions{
+		Program:   prog,
+		Interface: iface.Index,
+		Flags:     link.XDPGenericMode, // Change to XDPDriverMode if your NIC supports it
+		Replace:   true,
+	})
+	must(err)
+	defer lnk.Close()
 
-    portMap := coll.Maps["blocked_port_map"]
-    if portMap == nil {
-        log.Fatalf("Map 'blocked_port_map' not found")
-    }
+	// Use port from CLI or default
+	port := uint16(4040)
+	if len(os.Args) > 1 {
+		if p, err := strconv.Atoi(os.Args[1]); err == nil && p > 0 && p < 65535 {
+			port = uint16(p)
+		}
+	}
+	fmt.Printf("Blocking TCP port: %d\n", port)
 
-    var key uint32 = 0
-    value := new(bytes.Buffer)
-    binary.Write(value, binary.BigEndian, port)
+	portMap := coll.Maps["blocked_port_map"]
+	if portMap == nil {
+		log.Fatalf("Map 'blocked_port_map' not found")
+	}
 
-    err = portMap.Put(key, value.Bytes())
-    must(err)
+	var key uint32 = 0
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, htons(port))
 
-    fmt.Println("eBPF XDP program attached. Press Ctrl+C to stop.")
-    select {}
-}
+	err = portMap.Put(key, buf.Bytes())
+	must(err)
 
-// Convert interface name to index
-func ifaceIndex(name string) int {
-    iface, err := net.InterfaceByName(name)
-    must(err)
-    return iface.Index
+	fmt.Println("XDP program attached. Press Ctrl+C to exit.")
+	select {}
 }
